@@ -1,0 +1,357 @@
+import pandas as pd
+import numpy as np
+import time
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+from tensorflow import keras
+from tensorflow import reshape
+import seaborn as sns
+import warnings
+import os
+import time
+import math
+import tensorflow as tf
+from scipy.sparse.linalg import eigs
+from tensorflow.keras import layers
+from sklearn import preprocessing
+from sklearn.preprocessing import MinMaxScaler
+
+
+from google.colab import drive
+drive.mount('/content/drive')
+
+
+#Time Series Datasets
+# Input the prediction Interval and look-back window and output the dataset
+class DataLoader:
+    def __init__(self, data_path, look_back_window, prediction_interval):
+        # base_dd = os.getcwd() + '/Data/' + str(dataset_name) + '.h5'
+        base_dd = data_path #os.getcwd() + '/pems-bay.h5'    #'/V_228.csv'
+        self.lb = int(look_back_window)
+        self.pi = int(prediction_interval)
+        #df = pd.read_hdf(base_dd)
+        #df.replace(0,df.mean(axis=0),inplace=True)
+        #self.data = df.values
+
+        df = pd.read_csv(base_dd)
+        self.data = df.values
+        self.vals = [96, 336, 720]
+        # data_array = df.values
+        # self.data = data_array/np.max(data_array)
+
+    def make_dataset(self):
+        # Convert the data_list element into dataset using prediction interval and look-back window info
+        #total_samples = math.ceil((self.data.shape[0])) - self.lb - self.pi + 1
+        total_samples = math.floor((math.ceil((self.data.shape[0])) - self.lb - self.pi + 1)/2)
+        sample_dim = self.data.shape[1]
+
+        # Create the dataset
+        dataset_x = np.zeros((total_samples, self.lb, sample_dim))
+        dataset_y = np.zeros((total_samples, self.pi, sample_dim))
+
+        for j in range(total_samples):
+            dataset_x[j, :, :] = self.data[j:(j+self.lb), :]
+            dataset_y[j, :, :] = self.data[(j+self.lb):(j+self.lb+self.pi), :]
+
+        dataset_y = dataset_y[:, [95, 335, 719], :]
+
+        return dataset_x, dataset_y
+
+    def generate_dataset(self):
+        return self.make_dataset()
+
+
+lookback_window =  96
+prediction_interval = 720
+
+#Datapath
+#dp = '/content/drive/MyDrive/TransformerTimeSeriesDatasets/exchange_rate.txt'
+dp = '/content/drive/MyDrive/TransformerTimeSeriesDatasets/traffic.txt'
+#dp = '/content/drive/MyDrive/TransformerTimeSeriesDatasets/electricity.txt'
+
+# Load Dataset
+#(96, 336, 720)
+dl = DataLoader(dp, lookback_window, prediction_interval)
+data = dl.generate_dataset()
+X = data[0]
+Y = data[1]
+
+X = np.expand_dims(X, axis=3)
+
+#print(X.shape)
+#print(Y.shape)
+
+# Dividing data into training, validation and test sets
+net_data_size = int(X.shape[0])
+train_size = int(np.ceil(0.7 * net_data_size))
+val_size = int(np.ceil(0.15 * net_data_size))
+test_size = net_data_size - train_size - val_size
+
+X_tr = X[0:train_size, :, :, :]
+Y_tr = Y[0:train_size, :, :]
+X_val = X[train_size:(train_size + val_size), :, :, :]
+Y_val = Y[train_size:(train_size + val_size), :, :]
+X_test = X[(train_size + val_size):, :, :, :]
+Y_test = Y[(train_size + val_size):, :, :]
+
+#print(X_tr.shape)
+#print(X_val.shape)
+#print(X_test.shape)
+
+
+# Perform data normalization (use train set mean and variance)
+X_mean = np.mean(X_tr, axis=0)
+X_var = np.sqrt(np.sum(np.square(np.subtract(X_tr, X_mean)), axis=0) / X_tr.shape[0])
+X_tr = np.divide(np.subtract(X_tr, X_mean), X_var)
+X_var = np.where(X_var>0, X_var, 1)
+X_val = np.divide(np.subtract(X_val, X_mean), X_var)
+X_test = np.divide(np.subtract(X_test, X_mean), X_var)
+
+X_tr = np.squeeze(X_tr)
+X_val = np.squeeze(X_val)
+X_test = np.squeeze(X_test)
+
+# Randomly re-shuffling the training data and ground truths
+np.random.seed(2)
+reorder = np.random.permutation(X_tr.shape[0])
+X_tr = X_tr[reorder, :, :]
+Y_tr = Y_tr[reorder, :, :]
+
+X_tr = X_tr[:, :, :]
+X_val = X_val[:, :, :]
+X_test = X_test[:, :, :]
+
+Y_tr = Y_tr[:,:,:]
+Y_val = Y_val[:,:,:]
+Y_test = Y_test[:,:,:]
+
+X_tr = np.reshape(X_tr,(train_size,-1))
+Y_tr = np.reshape(Y_tr,(train_size,-1))
+
+X_val = np.reshape(X_val,(val_size,-1))
+Y_val = np.reshape(Y_val,(val_size,-1))
+
+X_test = np.reshape(X_test,(test_size,-1))
+Y_test = np.reshape(Y_test,(test_size,-1))
+
+
+# Multi-head convolution-position-aware-attention with Q, K, V
+class multiHeadConvPaAttentionM2(tf.keras.layers.Layer):
+    def __init__(self, key_dim, num_heads, tconv_dim, tconv_stride, ifw):
+        super(multiHeadConvPaAttentionM2, self).__init__()
+        self.key_dim = key_dim
+        self.num_heads = num_heads
+        self.head_dim = int(key_dim/num_heads)
+        self.tconv_dim = tconv_dim
+        self.tconv_stride = tconv_stride
+        self.ifw = ifw
+
+    def build(self, input_shape):
+        self.WqL = []
+        self.WkL = []
+        self.WvL = []
+        self.convKer = []
+        self.tq = []
+
+        for i in range(self.num_heads):
+
+            self.convKer.append(layers.Conv2D((3*self.head_dim), (self.tconv_dim, self.key_dim), strides=(self.tconv_stride,1), activation="relu")) #, padding="same"
+            self.tq.append(keras.Sequential(
+            [layers.Dense(64, activation="relu"), layers.Dense(64, activation="relu"), layers.Dense(2, activation="softmax"),]))
+
+        Wlt_init = init = tf.random_normal_initializer()
+        self.Wlt = tf.Variable(initial_value=Wlt_init(shape=((self.num_heads * self.head_dim), int(input_shape[-1])), dtype="float32"), trainable=True)
+
+        self.temp_dim_f = math.floor((int(input_shape[-2]) - self.tconv_dim + 1)/self.tconv_stride)
+
+    def call(self, inputs):
+
+        # inputs : batch_size x time_steps x input_dim
+        x = inputs
+
+        x = tf.expand_dims(x, axis=-1)
+
+        a_xL = []
+
+        # Generate Query, Key and Value corresponding to each attention head
+        for i in range(self.num_heads):
+
+            x_tran = self.convKer[i](x)
+
+            # Query : batch_size x math.floor((2*((time_steps - tconvL + 1) - pool_size)) / pool_size)+1 x dq
+            xq = tf.squeeze(x_tran[:,:,:,0:self.head_dim], [2])
+
+            # Key : batch_size x math.floor((2*((time_steps - tconvL + 1) - pool_size)) / pool_size)+1 x dk
+            xk = tf.squeeze(x_tran[:,:,:,self.head_dim:(2*self.head_dim)], [2])
+
+            # Value : batch_size x math.floor((2*((time_steps - tconvL + 1) - pool_size)) / pool_size)+1 x dv
+            xv = tf.squeeze(x_tran[:,:,:,(2*self.head_dim):], [2])
+
+            # Transposing each key in a batch (xk_t : batch_size x dk x math.floor((2*((time_steps - tconvL + 1) - pool_size)) / pool_size)+1)
+            xk_t = tf.transpose(xk, perm=[0, 2, 1])
+
+            # Computing scaled dot product self attention of each time step in each training sample (s_a : batch_size x math.floor((2*((time_steps - tconvL + 1) - pool_size)) / pool_size)+1 x math.floor((2*((time_steps - tconvL + 1) - pool_size)) / pool_size)+1)
+            s_a = tf.math.multiply(tf.keras.layers.Dot(axes=(1, 2))([xk_t, xq]), (1/self.head_dim))
+
+            # Applying Softmax Layer to the self attention weights for proper scaling (sft_s_a : batch_size x math.floor((2*((time_steps - tconvL + 1) - pool_size)) / pool_size)+1 x math.floor((2*((time_steps - tconvL + 1) - pool_size)) / pool_size)+1)
+            # First coloumn contains the attention weights of first query
+            sft_s_a = tf.keras.layers.Softmax(axis=2)(s_a)
+
+            # Temporal Information
+            tmul_a = self.tq[i](tf.transpose(sft_s_a, perm=[0, 2, 1]))
+
+            # Computing attention augmented values for each time step and each training sample (a_x : batch_size x math.floor((2*((time_steps - tconvL + 1) - pool_size)) / pool_size)+1 x dim)
+            auv = tf.keras.layers.Dot(axes=(1, 2))([xv, sft_s_a])
+            auv = tf.transpose(auv, perm=[0, 2, 1])
+
+            # Computing the average info matrix
+            aam = sft_s_a.shape[-2] * tf.ones([1, sft_s_a.shape[-2], sft_s_a.shape[-1]])
+            aim = tf.keras.layers.Dot(axes=(1, 2))([xv, aam])
+            aim = tf.transpose(aim, perm=[0, 2, 1])
+
+            # Temporal Information Fusion
+            # r = tf.concat([tf.expand_dims(auv, 3), tf.expand_dims(xv, 3)], 3)
+            r = tf.concat([tf.expand_dims(auv, 3), tf.expand_dims(aim, 3)], 3)
+            g = tf.expand_dims(tmul_a, 2)
+            a_xL.append(tf.math.reduce_sum(tf.math.multiply(r, g), axis=3))
+
+        # Concatenate and applying linear transform for making dimensions compatible
+        a_x = tf.concat(a_xL, -1)
+
+        # Get the dimensions compatible after applying linear transform
+        a_x_tran = tf.matmul(a_x, self.Wlt)
+
+        return a_x_tran
+
+
+class TransformerBlockConvPaAttM2(layers.Layer):
+    def __init__(self, embed_dim, num_heads, tconv_dim, tconv_stride, ifw, ff_dim, rate=0.1):
+        super(TransformerBlockConvPaAttM2, self).__init__()
+        self.att = multiHeadConvPaAttentionM2(embed_dim, num_heads, tconv_dim, tconv_stride, ifw)
+        self.ffn =keras.Sequential(
+            [layers.Dense(ff_dim, activation="relu"), layers.Dense(embed_dim),]
+        )
+        self.layernorm1 = layers.LayerNormalization(epsilon=1e-6)
+        self.layernorm2 = layers.LayerNormalization(epsilon=1e-6)
+        self.dropout1 = layers.Dropout(rate)
+        self.dropout2 = layers.Dropout(rate)
+
+    def call(self, inputs, training):
+        attn_output = self.att(inputs)
+        attn_output = self.dropout1(attn_output, training=training)
+        out1 = self.layernorm1(attn_output)
+        ffn_output = self.ffn(out1)
+        ffn_output = self.dropout2(ffn_output, training=training)
+        return self.layernorm2(out1 + ffn_output)
+
+
+# Transformer Network
+
+embed_dim = 3*X_tr.shape[-1]
+tconv_dim = 1
+tconv_stride = 1
+num_heads = 6
+ff_dim = 64
+ifw = 1
+
+time_steps = X_tr.shape[-2]
+
+# Initializing the transformer blocks
+num_transformer_blocks = 3
+transformer_blocks = []
+
+for i in range(num_transformer_blocks):
+  transformer_blocks.append(TransformerBlockConvPaAttM2(embed_dim, num_heads, tconv_dim, tconv_stride, ifw, ff_dim))
+
+# Model
+inputs = layers.Input(shape=(X_tr.shape[-2], X_tr.shape[-1],))
+x = inputs
+
+# Embedding Dimension
+x = layers.Dense(embed_dim, activation="relu")(x)
+
+# Trainable Temporal Embedding
+#embedding_layer = PositionEmbeddingLayer(time_steps, embed_dim)
+#x = embedding_layer(x)
+
+for i in range(num_transformer_blocks):
+    x = transformer_blocks[i](x)
+    #x = layers.Dropout(0.2)(x)
+
+x =  layers.GlobalAveragePooling1D()(x) #layers.Flatten()(x)
+#x = x[:,-1,:,:]
+#x = layers.Flatten()(x)
+
+x = layers.Dense(32, activation="relu")(x)
+x = layers.Dropout(0.2)(x)
+outputs = layers.Dense(Y_tr.shape[-1])(x)
+
+stdtr_model = keras.Model(inputs=inputs, outputs=outputs)
+
+stdtr_model.summary()
+
+stdtr_model.compile(optimizer='adam', loss='mse', metrics=['mse'])
+
+# Learning Rate Scheduler
+def scheduler(epoch, lr):
+    exp = np.floor((1 + epoch) / 50)
+    alpha = 0.001 * (0.75 ** exp)
+    return float(alpha)
+
+# setup callbacks
+callbacks = [tf.keras.callbacks.LearningRateScheduler(scheduler)]
+
+history = stdtr_model.fit(
+    X_tr, Y_tr, batch_size=128, epochs=10, validation_data=(X_test, Y_test), callbacks=callbacks
+)
+
+st = time.time()
+Y_pred = stdtr_model.predict(X_test, verbose=0)
+et = time.time()
+
+print(et - st)
+
+test_mae = np.mean(abs(Y_pred - Y_test))
+test_se = np.sqrt(np.mean(np.square(Y_pred - Y_test)))
+
+print(test_mae)
+print(test_se)
+
+
+# Model
+inputs = layers.Input(shape=(X_tr.shape[-1],))
+
+x = inputs
+
+outputs = layers.Dense(Y_tr.shape[-1])(x)
+
+model = keras.Model(inputs=inputs, outputs=outputs)
+
+model.summary()
+
+model.compile(optimizer='adam', loss='mse', metrics=['mse','mae'])
+
+# Learning Rate Scheduler
+def scheduler(epoch, lr):
+    exp = np.floor((1 + epoch) / 50)
+    alpha = 0.01 * (0.75 ** exp)
+    return float(alpha)
+
+# setup callbacks
+callbacks = [tf.keras.callbacks.LearningRateScheduler(scheduler)]
+
+history = model.fit(
+    X_tr, Y_tr, batch_size=128, epochs=350, validation_data=(X_test, Y_test), callbacks=callbacks
+)
+
+st = time.time()
+Y_pred = model.predict(X_test, verbose=0)
+et = time.time()
+
+print(et - st)
+
+test_mae = np.mean(abs(Y_pred - Y_test))
+test_se = np.sqrt(np.mean(np.square(Y_pred - Y_test)))
+
+print(test_mae)
+print(test_se)
