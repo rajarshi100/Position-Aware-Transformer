@@ -328,15 +328,3 @@ samples × lookback_window × num_features
 ```text
 samples × flattened_features
 ```
-
-## Suggested Improvements
-
-Possible improvements include:
-
-* Use `X_val` and `Y_val` for validation instead of the test set.
-* Save trained models using `model.save()`.
-* Add command-line arguments for dataset path and hyperparameters.
-* Add plotting functions for predicted vs. actual values.
-* Add reproducibility controls for TensorFlow random seeds.
-* Separate the code into modules such as `data_loader.py`, `model.py`, `train.py`, and `evaluate.py`.
-* Log experiment results to a CSV file for easier comparison.
